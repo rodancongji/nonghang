@@ -872,6 +872,5 @@ node_df['risk_score'] = node_df['centrality_norm'] * node_df['risk_entropy']
 > - 用图算法做路径扩展和中心性排序，辅助人工调查  
 > - 输出“可疑资金归集账户Top 100”比“无效社区”更有业务价值
 
----
+"""
 
-如需，我可为你提供修改后的 `2_build_graph_and_leiden.py` 关键片段（边权重处理、子图构建、中介分数计算等）。这个项目有很好潜力，只需调整方向即可产出高价值结果。"""
