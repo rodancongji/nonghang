@@ -596,3 +596,91 @@ print('   - intermediary_subgraph.png: 中介账户子图')
 print('   - community_risk_distribution.png: 社区风险分布图')
 
 print(f'\n 总运行时间: {time.time() - start_t:.2f} 秒')
+
+"""D:\Anaconda\envs\RAG_Learning\python.exe D:\Pycharm\Intermediaries_digging\src\2_build_graph_and_leiden.py 
+=== 1. 分块构建有向加权图（含预过滤） ===
+  chunk 5 processed, edges: 644,040
+  chunk 10 processed, edges: 1,595,262
+  → 过滤掉权重最低 10% 的边，剩余 2,082,983 / 原 2,314,409 条边
+ 有向图建成 |V|=1,081,673 |E|=2,082,983  t=395.98s
+
+=== 2. 网格搜索最优分辨率（串行版） ===
+  → 评估分辨率: 0.02
+    res=0.020  F1=0.008  Q=7492968173.757
+ 最佳分辨率 = 0.02  F1 = 0.008  总耗时: 118.39s
+
+=== 3. 高风险社区统计 ===
+ Top-10 高风险社区：
+              total_nodes  total_w  bad_ratio
+community_id                                 
+5202                   10      5.0   0.500000
+5364                   10      5.0   0.500000
+4518                   12      5.0   0.416667
+4642                   12      5.0   0.416667
+4393                   13      5.0   0.384615
+4332                   13      5.0   0.384615
+4375                   13      5.0   0.384615
+4100                   14      5.0   0.357143
+3967                   15      5.0   0.333333
+4063                   15      5.0   0.333333
+
+=== 4. 识别中介账户（高效版） ===
+  → 计算节点中心性...
+  → 计算邻居社区分布...
+    进度: 0.0% (0/1,081,673 节点)
+    进度: 10.0% (108,167/1,081,673 节点)
+    进度: 20.0% (216,334/1,081,673 节点)
+    进度: 30.0% (324,501/1,081,673 节点)
+    进度: 40.0% (432,668/1,081,673 节点)
+    进度: 50.0% (540,835/1,081,673 节点)
+    进度: 60.0% (649,002/1,081,673 节点)
+    进度: 70.0% (757,169/1,081,673 节点)
+    进度: 80.0% (865,336/1,081,673 节点)
+    进度: 90.0% (973,503/1,081,673 节点)
+    进度: 100.0% (1,081,670/1,081,673 节点)
+  → 邻居社区计算完成
+  → 识别中介账户候选...
+ 识别出 80 个中介账户候选  t=47.36s
+
+ Top-10 中介账户：
+                                              account_id  ... risk_score
+6684   6eddaed88b09cdf0cc1f41befd74d4e655f44f59d74254...  ...        0.5
+8107   dae6a3ba750619e6dcdd0287ed32fc764e02df595034ef...  ...        0.5
+13026  2bb9d0974cb658da06289c9bc3b0376f8de3bdfd02dcd3...  ...        0.5
+19669  d1c1c8dea15c36b6c80b9c88b9675c325699466b1c7d7f...  ...        0.5
+20844  d774afb6ffae3b07e6ad9ad078b21afd3eee18dd027fb6...  ...        0.5
+48808  5bbe189db299e0591a3e88e4cc29007df730c182f48703...  ...        0.5
+51916  496c53ac0d8824c44904a562acf1e273a4f5fd66b05aae...  ...        0.5
+54950  21f728848f8077cbd1f14b1af5ab4fe2308dc0ccd68ed7...  ...        0.5
+55140  c102c00eca303fcb6e2be1b29b4a0aeabae8ac91692b68...  ...        0.5
+59200  d53a8b5e74a1f6fc80ad28b000320efd46f3b59a78b555...  ...        0.5
+
+[10 rows x 6 columns]
+
+=== 5. 保存结果 ===
+ 已保存：intermediaries.csv
+ 已保存：leiden_communities.csv, leiden_community_risk.csv, node_features.csv
+
+=== 5.5 保存图结构为 JSON 格式 ===
+ 图结构已保存至：D:/Pycharm/Intermediaries_digging/output/graph_structure.json
+    节点数：1,081,673 | 边数：2,082,983
+
+=== 6. 可视化中介账户子图 ===
+  → 构建可视化子图...
+ 已保存中介账户子图：intermediary_subgraph.png, intermediary_subgraph.gexf
+
+=== 7. 可视化社区风险分布 ===
+
+ 图构建 + 中介账户识别 + 可视化全流程完成！
+关键产出：
+   - leiden_communities.csv: 节点-社区映射
+   - leiden_community_risk.csv: 社区风险统计
+   - node_features.csv: 节点拓扑特征
+   - intermediaries.csv: 中介账户列表（如有）
+   - graph_structure.json: 完整图结构（JSON格式）
+   - intermediary_subgraph.png: 中介账户子图
+   - community_risk_distribution.png: 社区风险分布图
+
+ 总运行时间: 633.86 秒
+
+Process finished with exit code 0"""
