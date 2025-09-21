@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-步骤1：数据探索与清洗（终极正确版）
+步骤1：数据探索与清洗（终极修复版）
 功能：
   - 加载账户、交易、对手方对照表
   - 清洗无效交易 & 标准化字段
-  - 用 '对收方名称' 正确映射对手方对照表，获取可读名称
+  - 用 '对收方名称' 初步映射，再按 counterparty_id 稳定化对手方名称（避免节点分裂）
   - 合并账户/对手方风险标签
+  - 分析对手方与账户ID对应关系（为图结构做准备）
   - 保存清洗后数据，供后续图构建使用
 """
 
@@ -53,10 +54,14 @@ print("\n[3/7] 数据清洗与字段标准化（保留 direction=1 和 2）...")
 txn_df.rename(columns={
     '时间': 'timestamp',
     '客户唯一id': 'account_id',
-    '对手账号': 'counterparty_id',
-    '交易金额': 'amount',
+    '卡号': 'card_number',
+    '现金标志（00现金，01转账）': 'cash',
     '收付标志（01收，02付）': 'direction',
+    '交易金额': 'amount',
+    '交易后余额': 'balance',
     '交易渠道（1柜面，2网银，4atm，5pos，6手机银行，iwl网联，9其他）': 'channel',
+    '对手账号': 'counterparty_id',
+    '对收方名称':'counterparty_name',
     '备注': 'remark',
     '对手方所在地区': 'region',
     '代理人唯一id': 'agent_id'
@@ -66,7 +71,7 @@ txn_df.rename(columns={
 txn_df['direction'] = txn_df['direction'].astype(str).str.strip()
 print(f"direction 唯一值：{txn_df['direction'].unique()}")
 print("收款交易（direction='1'）示例：")
-print(txn_df[txn_df['direction']=='1'][['counterparty_id','对收方名称']].head())
+print(txn_df[txn_df['direction']=='1'][['counterparty_id','counterparty_name']].head())
 
 # 时间 & 金额标准化
 txn_df['timestamp'] = pd.to_datetime(txn_df['timestamp'], errors='coerce')
@@ -86,8 +91,8 @@ print(f"付款交易（direction=2）：{len(txn_df[txn_df['direction']=='2']):,
 print(f"收款交易（direction=1）：{len(txn_df[txn_df['direction']=='1']):,}")
 
 
-# ==================== 4. 合并对手方名称（核心：用“对收方名称”匹配） ====================
-print("\n[4/7] 合并对手方名称（使用 '对收方名称' → 'Encrypted'）...")
+# ==================== 4. 初步合并对手方名称（使用 'counterparty_name' → 'Encrypted'） ====================
+print("\n[4/7] 初步合并对手方名称（使用 'counterparty_name' → 'Encrypted'）...")
 
 # 标准化对手方表字段
 if 'Encrypted' in opponent_df.columns and 'TCNM' in opponent_df.columns:
@@ -99,14 +104,14 @@ elif 'counterparty_id' not in opponent_df.columns or 'opponent_name' not in oppo
 opponent_df = opponent_df[['counterparty_id', 'opponent_name']].drop_duplicates().reset_index(drop=True)
 print(f"对手方表处理完成，共 {len(opponent_df):,} 行")
 
-# 保留原始字段（'对收方名称' 实际是加密哈希）
-txn_df['counterparty_name_hash'] = txn_df['对收方名称'].copy()
+# 保留原始字段
+txn_df['counterparty_name_hash'] = txn_df['counterparty_name'].copy()
 
 # 核心：用 '对收方名称' 匹配 opponent_df['counterparty_id']
-print("执行映射合并...")
+print("执行初步映射合并...")
 txn_df = txn_df.merge(
     opponent_df,
-    left_on='对收方名称',
+    left_on='counterparty_name',
     right_on='counterparty_id',
     how='left',
     suffixes=('', '_mapped')
@@ -117,18 +122,43 @@ if 'opponent_name' not in txn_df.columns:
 
 txn_df.rename(columns={'opponent_name': 'mapped_opponent_name'}, inplace=True)
 
-# 统计映射结果（无需比较名称，join 已确保键匹配）
+# 统计映射结果
 mapped_count = txn_df['mapped_opponent_name'].notna().sum()
-print(f"\n成功映射可读名称的交易数：{mapped_count:,} ({mapped_count/len(txn_df)*100:.2f}%)")
+print(f"\n初步成功映射可读名称的交易数：{mapped_count:,} ({mapped_count/len(txn_df)*100:.2f}%)")
 
 # 展示映射示例
-print("\n=== 映射成功示例（前5条） ===")
-print(txn_df[txn_df['mapped_opponent_name'].notna()][['对收方名称', 'mapped_opponent_name']].head())
+print("\n=== 初步映射成功示例（前5条） ===")
+print(txn_df[txn_df['mapped_opponent_name'].notna()][['counterparty_name', 'mapped_opponent_name','account_id']].head())
 
-# 填充未映射记录 & 创建最终字段
-txn_df['mapped_opponent_name'] = txn_df['mapped_opponent_name'].fillna('未知')
-txn_df['opponent_name'] = txn_df['mapped_opponent_name'].copy()
 
+# ==================== 4.5/7 修复：重建稳定对手方名称映射（按 counterparty_id 取众数） ====================
+print("\n[4.5/7] 重建稳定对手方名称映射（按 counterparty_id 取最频繁名称，避免图节点分裂）...")
+
+# 步骤1：收集所有已知映射（包括初步映射和原始字段）
+# 创建一个映射字典：counterparty_id -> 最常出现的 opponent_name
+all_name_mappings = txn_df[['counterparty_id', 'mapped_opponent_name']].copy()
+all_name_mappings['mapped_opponent_name'] = all_name_mappings['mapped_opponent_name'].fillna('未知')
+
+# 按 counterparty_id 分组，取出现频率最高的名称
+stable_name_map = (
+    all_name_mappings.groupby('counterparty_id')['mapped_opponent_name']
+    .agg(lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else '未知')
+    .to_dict()
+)
+
+# 步骤2：应用稳定映射
+txn_df['opponent_name'] = txn_df['counterparty_id'].map(stable_name_map).fillna('未知')
+
+print(f" 稳定映射完成。唯一对手方ID数：{len(stable_name_map):,}")
+
+# 步骤3：为“未知”类生成可区分名称（避免所有未知合并成一个节点）
+print(">>> 为 '未知' 类对手方生成区分ID（基于 counterparty_id 前8位）...")
+txn_df.loc[txn_df['opponent_name'] == '未知', 'opponent_name'] = \
+    'Unknown_' + txn_df.loc[txn_df['opponent_name'] == '未知', 'counterparty_id'].str[:8]
+
+print(" 对手方名称已稳定化并区分匿名实体，可安全用于图构建。")
+
+# 打印最终 opponent_name 分布（前15）
 print("\n最终 opponent_name 分布（前15）：")
 print(txn_df['opponent_name'].value_counts().head(15))
 
@@ -156,24 +186,119 @@ txn_df = txn_df.merge(
 txn_df['account_label'] = txn_df['account_label'].fillna('未知')
 txn_df['counterparty_label'] = txn_df['counterparty_label'].fillna('未知')
 
-print(f"🏷标签合并完成：")
+print(f"标签合并完成：")
 print(f"账户方灰产数：{(txn_df['account_label'] == '灰').sum():,}")
+print(f"账户方黑次次次密接数：{(txn_df['account_label'] == '黑次次次密接').sum():,}")
+print(f"账户方黑次次密接数：{(txn_df['account_label'] == '黑次次密接').sum():,}")
+print(f"账户方黑次密接数：{(txn_df['account_label'] == '黑次密接').sum():,}")
+print(f"账户方黑密接数：{(txn_df['account_label'] == '黑密接').sum():,}")
+print(f"账户方黑产数：{(txn_df['account_label'] == '黑').sum():,}")
+print(f"账户方未知数：{(txn_df['account_label'] == '未知').sum():,}")
+
 print(f"对手方灰产数：{(txn_df['counterparty_label'] == '灰').sum():,}")
+print(f"对手方黑次次次密接数：{(txn_df['counterparty_label'] == '黑次次次密接').sum():,}")
+print(f"对手方黑次次密接数：{(txn_df['counterparty_label'] == '黑次次密接').sum():,}")
+print(f"对手方黑次密接数：{(txn_df['counterparty_label'] == '黑次密接').sum():,}")
+print(f"对手方黑密接数：{(txn_df['counterparty_label'] == '黑密接').sum():,}")
+print(f"对手方黑产数：{(txn_df['counterparty_label'] == '黑').sum():,}")
+print(f"对手方未知数：{(txn_df['counterparty_label'] == '未知').sum():,}")
+
+
+# ==================== 5.5/7 分析 counterparty_name, counterparty_id, account_id 对应关系 ====================
+print("\n[5.5/7] 对手方与账户ID对应关系分析（为图结构做准备）...")
+
+# 1. 检查有多少对手方 ID 同时出现在 account_id 中（即：对手方是否也是“名单内账户”）
+internal_counterparties = txn_df[
+    txn_df['counterparty_id'].isin(account_df['account_id'])
+]
+print(f"\n>>> 内部交易（对手方也是名单内账户）交易数：{len(internal_counterparties):,} ({len(internal_counterparties)/len(txn_df)*100:.2f}%)")
+
+# 展示部分内部交易示例
+print("\n=== 内部交易示例（前5条）===")
+if len(internal_counterparties) > 0:
+    print(internal_counterparties[['account_id', 'counterparty_id', 'opponent_name', 'amount', 'direction']].head())
+else:
+    print("无内部交易记录。")
+
+# 2. 检查 account_id == counterparty_id 的自环交易（自己转给自己）
+self_loops = txn_df[txn_df['account_id'] == txn_df['counterparty_id']]
+print(f"\n>>> 自环交易（account_id == counterparty_id）数：{len(self_loops):,}")
+if len(self_loops) > 0:
+    print("自环交易示例：")
+    print(self_loops[['account_id', 'counterparty_id', 'opponent_name', 'amount', 'direction']].head())
+
+# 3. 分析每个 account_id 最常交易的 counterparty_name（Top 3）—— 内存安全版
+print(f"\n>>> 每个账户最频繁交易的对手方（Top 3）示例（展示前5个账户）：")
+
+# 手动遍历分组，避免 Pandas apply + dict 崩溃
+top_counterparties_list = []
+grouped = txn_df.groupby('account_id')['opponent_name']
+
+# 只取前 1000 个账户避免性能问题
+sample_accounts = txn_df['account_id'].unique()[:1000]
+
+for account in sample_accounts:
+    name_series = grouped.get_group(account)
+    top3_dict = name_series.value_counts().head(3).to_dict()
+    top_counterparties_list.append({
+        'account_id': account,
+        'top_counterparties': top3_dict
+    })
+
+# 转为 DataFrame
+top_counterparties_per_account = pd.DataFrame(top_counterparties_list)
+
+# 展示前5个
+for _, row in top_counterparties_per_account.head(5).iterrows():
+    print(f"账户 {row['account_id']} → {row['top_counterparties']}")
+
+# 4. 统计高频对手方名称及其关联的 counterparty_id 数量（检查名称是否唯一映射ID）
+print(f"\n>>> 高频对手方名称及其关联的不同 counterparty_id 数量（检查歧义）：")
+name_to_id_mapping = (
+    txn_df.groupby('opponent_name')['counterparty_id']
+    .nunique()
+    .sort_values(ascending=False)
+    .head(15)
+)
+print(name_to_id_mapping)
+
+# 5. 反向：一个 counterparty_id 是否对应多个 opponent_name？（理论上不应该，除非映射错误）
+# → 现在应该基本为1，因为我们已经稳定化了映射
+print(f"\n>>> 检查稳定化后：一个 counterparty_id 是否仍对应多个 opponent_name？")
+id_to_name_mapping = (
+    txn_df.groupby('counterparty_id')['opponent_name']
+    .nunique()
+    .sort_values(ascending=False)
+)
+multi_name_ids = id_to_name_mapping[id_to_name_mapping > 1]
+if len(multi_name_ids) > 0:
+    print(f" 仍发现 {len(multi_name_ids)} 个 counterparty_id 对应多个名称（应极少），示例：")
+    example_id = multi_name_ids.index[0]
+    print(txn_df[txn_df['counterparty_id'] == example_id][['counterparty_id', 'opponent_name']].drop_duplicates())
+else:
+    print(" 所有 counterparty_id 均唯一对应一个 opponent_name（映射稳定）。")
+
+# 6. 查看灰产账户是否频繁与特定对手方交易
+print(f"\n>>> 灰产账户（黑/灰）最频繁交易的 Top 5 对手方：")
+risk_labels = ['黑', '黑密接', '黑次密接', '黑次次密接', '黑次次次密接', '灰']
+risk_flows = txn_df[txn_df['account_label'].isin(risk_labels)]
+top_risk_opponents = risk_flows['opponent_name'].value_counts().head(5)
+print(top_risk_opponents)
 
 
 # ==================== 6. 保存清洗后数据 ====================
 print("\n[6/7] 保存清洗后数据...")
 
 # 清理临时字段
-temp_cols = ['counterparty_name_hash', 'mapped_opponent_name', '对收方名称']
+temp_cols = ['counterparty_name_hash', 'mapped_opponent_name']
 drop_cols = [col for col in temp_cols if col in txn_df.columns]
 if drop_cols:
     txn_df = txn_df.drop(columns=drop_cols)
     print(f"已删除临时字段：{drop_cols}")
 
 # 保存
-output_txn = 'D:/Pycharm/Intermediaries_digging/output/cleaned_transactions.csv'
-output_acc = 'D:/Pycharm/Intermediaries_digging/output/cleaned_accounts.csv'
+output_txn = 'D:/Pycharm/Intermediaries_digging/data/cleaned_transactions.csv'
+output_acc = 'D:/Pycharm/Intermediaries_digging/data/cleaned_accounts.csv'
 
 txn_df.to_csv(output_txn, index=False, encoding='utf-8-sig')
 account_df.drop_duplicates('account_id').to_csv(output_acc, index=False, encoding='utf-8-sig')
@@ -189,10 +314,16 @@ print("   - direction == '2'（付款）: account_id → counterparty_id")
 print("   - direction == '1'（收款）: counterparty_id → account_id")
 print("边属性：amount, direction, timestamp, channel, opponent_name")
 print("节点属性：account_label, counterparty_label")
+print("节点类型：")
+print("   - 若 counterparty_id 在 account_df 中 → 节点类型 = 'account'")
+print("   - 否则 → 节点类型 = 'external'")
 
-print("\n 数据预处理完成！可进入图分析阶段。")
+print("\n 数据预处理完成！图结构已优化，可进入图分析阶段。")
 
-# 快速查看灰产账户主要交易对手
-gray_flows = txn_df[txn_df['account_label'] == '灰']['opponent_name'].value_counts().head(10)
-print("灰产账户主要交易对手：")
-print(gray_flows)
+
+# ==================== 8. 补充：灰产账户主要交易对手 Top 10（按类别） ====================
+print("\n>>> 各类灰产账户主要交易对手 Top 10：")
+for label in ['黑', '黑密接', '黑次密接', '黑次次密接', '黑次次次密接', '灰']:
+    flows = txn_df[txn_df['account_label'] == label]['opponent_name'].value_counts().head(10)
+    print(f"\n【{label}】账户 Top 10 交易对手：")
+    print(flows)

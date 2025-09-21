@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-终极生产版（串行+高效版）：Leiden 社区 + 中介账户识别 + 可视化增强
+终极生产版：Leiden 社区 + 中介账户识别 + 可视化增强 + JSON图导出
 优化点：
-  - 删除并行，避免 Windows pickle 错误
-  - 中介识别改用 igraph + numpy 向量化，避免 NetworkX 性能瓶颈
-  - 增加进度提示，避免“卡死”假象
+  - 修正路径：从 data/ 读取清洗后数据
+  - 增加图结构JSON导出（兼容Gephi/D3/前端）
+  - 增强稳定性：处理节点不在account_df中的情况
   - 保持完整功能：图构建、社区发现、中介识别、可视化
 """
 import pandas as pd
@@ -16,6 +16,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import time, os, warnings
+import json
 from collections import Counter
 
 warnings.filterwarnings('ignore')
@@ -23,7 +24,10 @@ plt.style.use('seaborn-v0_8-darkgrid')
 sns.set_palette("husl")
 
 # ===================== 1. 参数区 =====================
-DATA_PATH = 'D:/Pycharm/Intermediaries_digging/output/cleaned_transactions.csv'
+#
+DATA_PATH = 'D:/Pycharm/Intermediaries_digging/data/cleaned_transactions.csv'
+ACCOUNT_PATH = 'D:/Pycharm/Intermediaries_digging/data/cleaned_accounts.csv'
+
 CHUNK_SIZE = 1_000_000
 MIN_COMM_SIZE = 10
 VIS_TOP_K = 200
@@ -102,9 +106,12 @@ print(f' 有向图建成 |V|={g.vcount():,} |E|={g.ecount():,}  t={time.time() -
 # ===================== 3. 网格搜分辨率 + 加权投票（串行版） =====================
 print('\n=== 2. 网格搜索最优分辨率（串行版） ===')
 
-# 加载账户标签（只加载一次）
-account_df = pd.read_csv('D:/Pycharm/Intermediaries_digging/output/cleaned_accounts.csv')[['account_id', 'label']]
+# 加载账户标签（只加载一次）  修正路径
+account_df = pd.read_csv(ACCOUNT_PATH)[['account_id', 'label']]
 label_weight = account_df.set_index('account_id')['label'].map(WEIGHT_MAP).to_dict()
+
+# 创建 label_map 用于可视化（确保所有节点都有标签）
+label_map = dict(zip(account_df['account_id'], account_df['label']))
 
 # 真实风险账户（只计算一次）
 truth = account_df[account_df['label'].isin(['灰', '黑', '黑密接', '黑次密接', '黑次次密接'])]['account_id'].values
@@ -255,7 +262,8 @@ node_feat = pd.DataFrame({
     'community_id': community_ids,
     'comm_connections': comm_connections,
     'risk_ratio': risk_ratio_arr,
-    'label': pd.Series(node_names).map(account_df.set_index('account_id')['label']).values
+    # 修正：使用 label_map.get 并提供默认值
+    'label': [label_map.get(name, '未知') for name in node_names]
 })
 
 # 标准化 betweenness
@@ -297,17 +305,75 @@ else:
 
 # ===================== 6. 保存结果 =====================
 print('\n=== 5. 保存结果 ===')
-community_df.to_csv('output/leiden_communities.csv', index=False, encoding='utf-8-sig')
-comm_stat_final.to_csv('output/leiden_community_risk.csv', encoding='utf-8-sig')
-node_feat.to_csv('output/node_features.csv', index=False, encoding='utf-8-sig')
+community_df.to_csv('D:/Pycharm/Intermediaries_digging/output/leiden_communities.csv', index=False, encoding='utf-8-sig')
+comm_stat_final.to_csv('D:/Pycharm/Intermediaries_digging/output/leiden_community_risk.csv', encoding='utf-8-sig')
+node_feat.to_csv('D:/Pycharm/Intermediaries_digging/output/node_features.csv', index=False, encoding='utf-8-sig')
 
 if len(candidates) > 0:
-    candidates.to_csv('output/intermediaries.csv', index=False, encoding='utf-8-sig')
+    candidates.to_csv('D:/Pycharm/Intermediaries_digging/output/intermediaries.csv', index=False, encoding='utf-8-sig')
     print(' 已保存：intermediaries.csv')
 else:
     print(' 未保存 intermediaries.csv（无候选账户）')
 
 print(' 已保存：leiden_communities.csv, leiden_community_risk.csv, node_features.csv')
+
+
+# ===================== 6.5 保存图结构为 JSON =====================
+print('\n=== 5.5 保存图结构为 JSON 格式 ===')
+
+# 准备节点数据
+node_list = []
+for i, node_name in enumerate(g.vs['name']):
+    node_data = {
+        "id": node_name,
+        "community_id": int(community_ids[i]) if i < len(community_ids) else -1,
+        "pagerank": float(pr[i]) if i < len(pr) else 0.0,
+        "betweenness": float(btw[i]) if i < len(btw) else 0.0,
+        "in_strength": float(in_s[i]) if i < len(in_s) else 0.0,
+        "out_strength": float(out_s[i]) if i < len(out_s) else 0.0,
+        "label": str(label_map.get(node_name, '未知')),
+        "is_intermediary": node_name in (set(candidates['account_id']) if len(candidates) > 0 else set())
+    }
+    node_list.append(node_data)
+
+# 准备边数据
+edge_list = []
+for e in g.es:
+    src_idx, tgt_idx = e.tuple
+    src_name = g.vs[src_idx]['name']
+    tgt_name = g.vs[tgt_idx]['name']
+    edge_data = {
+        "source": src_name,
+        "target": tgt_name,
+        "weight": float(e['weight']) if 'weight' in e.attributes() else 1.0
+    }
+    edge_list.append(edge_data)
+
+# 准备元数据
+metadata = {
+    "total_nodes": g.vcount(),
+    "total_edges": g.ecount(),
+    "high_risk_communities": list(high_risk_comms) if 'high_risk_comms' in locals() else [],
+    "intermediaries": candidates['account_id'].tolist() if len(candidates) > 0 else [],
+    "best_resolution": float(best_res) if best_res is not None else None,
+    "generated_at": time.strftime("%Y-%m-%d %H:%M:%S")
+}
+
+# 组装完整图结构
+graph_json = {
+    "nodes": node_list,
+    "edges": edge_list,
+    "metadata": metadata
+}
+
+# 保存为 JSON 文件
+json_output_path = 'D:/Pycharm/Intermediaries_digging/output/graph_structure.json'
+with open(json_output_path, 'w', encoding='utf-8') as f:
+    json.dump(graph_json, f, ensure_ascii=False, indent=2)
+
+print(f' 图结构已保存至：{json_output_path}')
+print(f'    节点数：{len(node_list):,} | 边数：{len(edge_list):,}')
+
 
 # ===================== 7. 可视化：中介账户子图 =====================
 print('\n=== 6. 可视化中介账户子图 ===')
@@ -355,7 +421,6 @@ if len(candidates) > 0:
                             continue
 
         # 颜色映射
-        label_map = dict(zip(account_df['account_id'], account_df['label']))
         comm_map = dict(zip(community_df['account_id'], community_df['community_id']))
 
         node_colors = []
@@ -438,6 +503,7 @@ print('   - leiden_communities.csv: 节点-社区映射')
 print('   - leiden_community_risk.csv: 社区风险统计')
 print('   - node_features.csv: 节点拓扑特征')
 print('   - intermediaries.csv: 中介账户列表（如有）')
+print('   - graph_structure.json: 完整图结构（JSON格式）')
 print('   - intermediary_subgraph.png: 中介账户子图')
 print('   - community_risk_distribution.png: 社区风险分布图')
 print(f'\n 总运行时间: {time.time() - start_t:.2f} 秒')
