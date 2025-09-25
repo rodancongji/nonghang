@@ -20,7 +20,7 @@ INPUT_TXN_PATH = r'D:/Pycharm/Intermediaries_digging/data/cleaned_transactions.c
 GRAPH_PATH = r'D:/Pycharm/Intermediaries_digging/output/risk_propagation_graph.json'
 COMMUNITY_PATH = r'D:/Pycharm/Intermediaries_digging/output/gang_communities.csv'
 OUTPUT_DIR = r'D:/Pycharm/Intermediaries_digging/output'
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+#os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 txn = pd.read_csv(INPUT_TXN_PATH, encoding='utf-8-sig')
 print(f'交易记录 {len(txn):,}')
@@ -87,12 +87,13 @@ topo = pd.DataFrame({'account_id': beh['account_id']})
 topo['in_degree'] = topo['account_id'].map(deg_in).fillna(0)
 topo['out_degree'] = topo['account_id'].map(deg_out).fillna(0)
 topo['pagerank'] = topo['account_id'].map(pr).fillna(0)
-topo['betweenness'] = 0.0   # 可后续加采样
+#topo['betweenness'] = 0.0
 
 # 社区风险比例
 if comm is not None:
-    node_lbl = txn[['account_id', 'account_label']].drop_duplicates().set_index('account_id')['account_label']
-    comm['is_risk'] = comm['account_id'].map(node_lbl).isin(RISK_LABELS).astype(int)
+    # 确保 account_id 唯一：每个账户只取一个标签
+    node_lbl = txn[['account_id', 'account_label']].drop_duplicates(subset='account_id').set_index('account_id')['account_label']
+    comm['is_risk'] = comm['account_id'].map(node_lbl).fillna('正常').isin(RISK_LABELS).astype(int)
     comm_risk = comm.groupby('community_id')['is_risk'].mean().reset_index()
     comm_risk.columns = ['community_id', 'comm_risk_ratio']
     comm = comm.merge(comm_risk, on='community_id', how='left')
@@ -114,7 +115,7 @@ feats = feats.merge(lbl, left_on='account_id', right_index=True)
 
 X_train, X_test, y_train, y_test = train_test_split(
     feats[feat_cols], feats['is_risk'],
-    test_size=0.2, stratify=feats['is_risk'], random_state=42)
+    test_size=0.2, stratify=feats['is_risk'], random_state=3407)
 
 model = xgb.XGBClassifier(
     n_estimators=100, max_depth=6, learning_rate=0.1,
