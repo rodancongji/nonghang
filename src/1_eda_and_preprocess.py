@@ -8,7 +8,8 @@
   - 合并账户/对手方风险标签
   - 分析对手方与账户ID对应关系（为图结构做准备）
   - **新增：按时间划分训练/测试交易**
-  - 保存清洗后数据 + 训练交易 + 测试账户ID
+  - **同时保存全量数据 + 训练交易数据 + 测试账户ID**
+  - 保留所有原始 print() 和分析逻辑
 """
 import pandas as pd
 from datetime import datetime
@@ -123,7 +124,7 @@ print(">>> 为 '未知' 类对手方生成区分ID（基于 counterparty_id 前8
 txn_df.loc[txn_df['opponent_name'] == '未知', 'opponent_name'] = \
     'Unknown_' + txn_df.loc[txn_df['opponent_name'] == '未知', 'counterparty_id'].str[:8]
 print(" 对手方名称已稳定化并区分匿名实体，可安全用于图构建。")
-# 打印最终 opponent_name 分布（前15）
+# 打印最终 opponent_name 分布（前15） ← 修复：恢复为15
 print("\n最终 opponent_name 分布（前15）：")
 print(txn_df['opponent_name'].value_counts().head(15))
 # ==================== 5. 合并账户风险标签 ====================
@@ -238,7 +239,7 @@ test_txn = txn_df[txn_df['date'] >= CUT_OFF_DATE].copy()
 train_accounts = set(train_txn['account_id'].unique())
 test_accounts = set(test_txn['account_id'].unique())
 
-# 保存测试账户ID
+# 保存测试账户ID（路径修正：output 目录）
 pd.DataFrame({'account_id': list(test_accounts)}).to_csv(
     'D:/Pycharm/Intermediaries_digging/output/test_account_ids.csv', index=False, encoding='utf-8-sig'
 )

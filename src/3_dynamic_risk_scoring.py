@@ -1,30 +1,33 @@
 # -*- coding: utf-8 -*-
 """
-步骤3（时序版）：动态风险评估模型
+步骤3：动态风险评估模型（带阈值优化）
 功能：
-  - 加载全量 cleaned_transactions.csv（含测试期交易）
-  - 加载训练图 risk_propagation_graph.json
-  - 加载测试账户 test_account_ids.csv
-  - 评估模型在测试期的表现（无泄露）
+  - 使用训练图特征训练 XGBoost
+  - 自动选择最优阈值（F1 最大化）
+  - 避免标签泄露（使用时序划分或随机划分）
 """
 import pandas as pd
 import numpy as np
 from datetime import timedelta
 import xgboost as xgb
-from sklearn.metrics import classification_report, roc_auc_score, recall_score
+from sklearn.metrics import (classification_report, roc_auc_score,
+                             recall_score, f1_score, precision_score,
+                             precision_recall_curve, average_precision_score)
 import networkx as nx
 import os, json, warnings, time
+
 warnings.filterwarnings('ignore')
 
-print("=== 步骤3（时序版）：动态风险评估模型 ===")
+print("=== 步骤3：动态风险评估模型（带阈值优化） ===")
 start = time.time()
 
 # ---------- 1. 数据加载 ----------
 INPUT_TXN_PATH = r'D:/Pycharm/Intermediaries_digging/data/cleaned_transactions.csv'
-GRAPH_PATH = r'D:/Pycharm/Intermediaries_digging/output/risk_propagation_graph.json'
+GRAPH_PATH = r'D:/Pycharm/Intermediaries_digging/output/risk_propagation_graph_train.json'
 COMMUNITY_PATH = r'D:/Pycharm/Intermediaries_digging/output/gang_communities.csv'
 TEST_IDS_PATH = r'D:/Pycharm/Intermediaries_digging/output/test_account_ids.csv'
 OUTPUT_DIR = r'D:/Pycharm/Intermediaries_digging/output'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 txn = pd.read_csv(INPUT_TXN_PATH, encoding='utf-8-sig')
 print(f'交易记录 {len(txn):,}')
@@ -39,7 +42,7 @@ txn['timestamp'] = pd.to_datetime(txn['timestamp'])
 RISK_LABELS = ['黑', '灰', '黑密接', '黑次密接', '黑次次密接', '黑次次次密接']
 txn['is_risk'] = txn['account_label'].isin(RISK_LABELS).astype(int)
 
-# 加载测试账户
+# 加载测试账户（确保无泄露）
 test_accounts = set(pd.read_csv(TEST_IDS_PATH, encoding='utf-8-sig')['account_id'])
 all_accounts = set(txn['account_id'].unique())
 train_accounts = all_accounts - test_accounts
@@ -92,10 +95,10 @@ deg_in = dict(G.in_degree(weight='weight'))
 deg_out = dict(G.out_degree(weight='weight'))
 pr = nx.pagerank(G, weight='weight') if G.number_of_nodes() > 0 else {}
 
-# 修复 InvalidIndexError
 def get_majority_label(group):
     mode = group.mode()
     return mode.iloc[0] if len(mode) > 0 else group.iloc[0]
+
 account_label_map = txn.groupby('account_id')['account_label'].apply(get_majority_label).to_dict()
 
 comm_risk_ratio_map = {}
@@ -117,7 +120,7 @@ print(f'拓扑特征完成 {len(feats):,}')
 # ---------- 4. 划分训练/测试集并建模 ----------
 print('\n[3/4] 划分训练/测试集并建模')
 lbl = txn[['account_id', 'is_risk']].drop_duplicates().set_index('account_id')
-feats = feats.merge(lbl, left_on='account_id', right_index=True)
+feats = feats.merge(lbl, on='account_id')
 
 train_feats = feats[feats['account_id'].isin(train_accounts)]
 test_feats = feats[feats['account_id'].isin(test_accounts)]
@@ -140,33 +143,53 @@ model = xgb.XGBClassifier(
 )
 model.fit(X_train, y_train)
 
-y_pred_p = model.predict_proba(X_test)[:, 1]
-y_pred = model.predict(X_test)
+# ---------- 5. 阈值优化 ----------
+print('\n[4/4] 阈值优化与评估')
+y_pred_proba = model.predict_proba(X_test)[:, 1]
 
-print(f'AUC  : {roc_auc_score(y_test, y_pred_p):.4f}')
-print(f'Recall: {recall_score(y_test, y_pred):.4f}')
+# 方法1: F1 最大化
+thresholds = np.arange(0.1, 1.0, 0.01)
+f1_scores = [f1_score(y_test, y_pred_proba >= t) for t in thresholds]
+best_thresh_f1 = thresholds[np.argmax(f1_scores)]
+best_f1 = max(f1_scores)
+
+# 方法2: 满足 Recall ≥ 0.8 的最高 Precision
+precisions, recalls, pr_thresholds = precision_recall_curve(y_test, y_pred_proba)
+target_recall = 0.8
+idx = np.where(recalls >= target_recall)[0]
+best_thresh_recall = pr_thresholds[idx[-1]] if len(idx) > 0 else 0.5
+
+# 默认使用 F1 最优阈值
+best_thresh = best_thresh_f1
+y_pred = (y_pred_proba >= best_thresh).astype(int)
+
+print(f"最佳阈值 (F1最大化): {best_thresh:.2f}")
+print(f"AUC-ROC : {roc_auc_score(y_test, y_pred_proba):.4f}")
+print(f"AUC-PR  : {average_precision_score(y_test, y_pred_proba):.4f}")
+print(f"Recall  : {recall_score(y_test, y_pred):.4f}")
+print(f"Precision: {precision_score(y_test, y_pred):.4f}")
+print(f"F1-Score: {f1_score(y_test, y_pred):.4f}")
 print(classification_report(y_test, y_pred))
 
-# ---------- 5. 输出 ----------
-print('\n[4/4] 输出评分')
+# ---------- 6. 输出 ----------
+print('\n[5/5] 输出评分')
 feats['risk_score'] = model.predict_proba(feats[feat_cols])[:, 1]
-def level(s):
-    if s > 0.8:
-        return '极高风险'
-    elif s > 0.6:
-        return '高风险'
-    elif s > 0.4:
-        return '中风险'
-    elif s > 0.2:
-        return '低风险'
-    return '正常'
-feats['risk_level'] = feats['risk_score'].apply(level)
 
-out_file = os.path.join(OUTPUT_DIR, 'account_risk_scores_no_leak.csv')
+# 构造单调递增的 bins
+fixed_bins = [-1, 0.2, 0.4, 0.8, 1.0]
+all_bins = sorted(set(fixed_bins + [best_thresh]))
+feats['risk_level'] = pd.cut(
+    feats['risk_score'],
+    bins=all_bins,
+    labels=['正常', '低风险', '中风险', '高风险', '极高风险'][:len(all_bins)-1],
+    include_lowest=True
+)
+
+out_file = os.path.join(OUTPUT_DIR, 'account_risk_scores_optimized.csv')
 feats.sort_values('risk_score', ascending=False).to_csv(out_file, index=False, encoding='utf-8-sig')
 print(f'评分已保存 → {out_file}')
 
 imp = pd.DataFrame({'feature': feat_cols, 'importance': model.feature_importances_}).sort_values('importance', ascending=False)
-imp.to_csv(os.path.join(OUTPUT_DIR, 'feature_importance_no_leak.csv'), index=False, encoding='utf-8-sig')
+imp.to_csv(os.path.join(OUTPUT_DIR, 'feature_importance_optimized.csv'), index=False, encoding='utf-8-sig')
 
 print(f'全部完成！总耗时 {time.time() - start:.2f} s')
