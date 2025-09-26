@@ -1,26 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-步骤3：动态风险评估模型
+步骤3（时序版）：动态风险评估模型
+功能：
+  - 加载全量 cleaned_transactions.csv（含测试期交易）
+  - 加载训练图 risk_propagation_graph.json
+  - 加载测试账户 test_account_ids.csv
+  - 评估模型在测试期的表现（无泄露）
 """
 import pandas as pd
 import numpy as np
 from datetime import timedelta
 import xgboost as xgb
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, roc_auc_score, recall_score
 import networkx as nx
 import os, json, warnings, time
-
 warnings.filterwarnings('ignore')
-print("=== 步骤3：动态风险评估模型 ===")
+
+print("=== 步骤3（时序版）：动态风险评估模型 ===")
 start = time.time()
 
 # ---------- 1. 数据加载 ----------
 INPUT_TXN_PATH = r'D:/Pycharm/Intermediaries_digging/data/cleaned_transactions.csv'
 GRAPH_PATH = r'D:/Pycharm/Intermediaries_digging/output/risk_propagation_graph.json'
 COMMUNITY_PATH = r'D:/Pycharm/Intermediaries_digging/output/gang_communities.csv'
+TEST_IDS_PATH = r'D:/Pycharm/Intermediaries_digging/output/test_account_ids.csv'
 OUTPUT_DIR = r'D:/Pycharm/Intermediaries_digging/output'
-#os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 txn = pd.read_csv(INPUT_TXN_PATH, encoding='utf-8-sig')
 print(f'交易记录 {len(txn):,}')
@@ -34,7 +38,15 @@ except FileNotFoundError:
 txn['timestamp'] = pd.to_datetime(txn['timestamp'])
 RISK_LABELS = ['黑', '灰', '黑密接', '黑次密接', '黑次次密接', '黑次次次密接']
 txn['is_risk'] = txn['account_label'].isin(RISK_LABELS).astype(int)
-print(f'风险占比 {txn["is_risk"].mean():.2%}')
+
+# 加载测试账户
+test_accounts = set(pd.read_csv(TEST_IDS_PATH, encoding='utf-8-sig')['account_id'])
+all_accounts = set(txn['account_id'].unique())
+train_accounts = all_accounts - test_accounts
+
+print(f'总账户数: {len(all_accounts):,}')
+print(f'训练账户: {len(train_accounts):,}, 测试账户: {len(test_accounts):,}')
+print(f'全量风险占比: {txn["is_risk"].mean():.2%}')
 
 # ---------- 2. 行为特征（向量化） ----------
 print('\n[1/4] 行为特征（向量化）')
@@ -50,12 +62,10 @@ beh = txn.groupby('account_id').agg(
 beh['active_days'] = (beh['last_txn'] - beh['first_txn']).dt.days + 1
 beh['txn_freq'] = beh['total_txn'] / beh['active_days']
 
-# 夜间比例
 txn['is_night'] = ((txn.timestamp.dt.hour >= 22) | (txn.timestamp.dt.hour < 6)).astype(int)
 night = txn.groupby('account_id')['is_night'].agg(night_cnt='sum', total='count')
 beh['night_ratio'] = night['night_cnt'] / night['total']
 
-# 快进快出
 out = txn[txn['direction'] == '2'][['account_id', 'timestamp']].sort_values(['account_id', 'timestamp'])
 inn = txn[txn['direction'] == '1'][['account_id', 'timestamp']].sort_values(['account_id', 'timestamp'])
 if out.empty or inn.empty:
@@ -74,48 +84,54 @@ print(f'行为特征完成 {len(beh):,}')
 # ---------- 3. 图拓扑特征 ----------
 print('\n[2/4] 图拓扑特征')
 edges = pd.DataFrame(graph_data['edges'])[['source', 'target', 'weight']]
-edges['data'] = edges[['weight']].apply(lambda x: {'weight': x[0]}, axis=1)
 G = nx.DiGraph()
-G.add_edges_from(edges[['source', 'target', 'data']].itertuples(index=False))
+for _, row in edges.iterrows():
+    G.add_edge(row['source'], row['target'], weight=row['weight'])
 
-# 批量计算中心性
 deg_in = dict(G.in_degree(weight='weight'))
 deg_out = dict(G.out_degree(weight='weight'))
-pr = nx.pagerank(G, weight='weight')
+pr = nx.pagerank(G, weight='weight') if G.number_of_nodes() > 0 else {}
+
+# 修复 InvalidIndexError
+def get_majority_label(group):
+    mode = group.mode()
+    return mode.iloc[0] if len(mode) > 0 else group.iloc[0]
+account_label_map = txn.groupby('account_id')['account_label'].apply(get_majority_label).to_dict()
+
+comm_risk_ratio_map = {}
+if comm is not None:
+    comm['is_risk'] = comm['account_id'].map(account_label_map).fillna('正常').isin(RISK_LABELS).astype(int)
+    comm_risk = comm.groupby('community_id')['is_risk'].mean().to_dict()
+    comm_id_map = comm.set_index('account_id')['community_id'].to_dict()
+    comm_risk_ratio_map = {node: comm_risk.get(comm_id_map.get(node, -1), 0.0) for node in comm['account_id']}
 
 topo = pd.DataFrame({'account_id': beh['account_id']})
 topo['in_degree'] = topo['account_id'].map(deg_in).fillna(0)
 topo['out_degree'] = topo['account_id'].map(deg_out).fillna(0)
 topo['pagerank'] = topo['account_id'].map(pr).fillna(0)
-#topo['betweenness'] = 0.0
-
-# 社区风险比例
-if comm is not None:
-    # 确保 account_id 唯一：每个账户只取一个标签
-    node_lbl = txn[['account_id', 'account_label']].drop_duplicates(subset='account_id').set_index('account_id')['account_label']
-    comm['is_risk'] = comm['account_id'].map(node_lbl).fillna('正常').isin(RISK_LABELS).astype(int)
-    comm_risk = comm.groupby('community_id')['is_risk'].mean().reset_index()
-    comm_risk.columns = ['community_id', 'comm_risk_ratio']
-    comm = comm.merge(comm_risk, on='community_id', how='left')
-    topo = topo.merge(comm[['account_id', 'comm_risk_ratio']].drop_duplicates(),
-                      on='account_id', how='left')
-    topo['comm_risk_ratio'] = topo['comm_risk_ratio'].fillna(0)
-else:
-    topo['comm_risk_ratio'] = 0.0
+topo['comm_risk_ratio'] = topo['account_id'].map(comm_risk_ratio_map).fillna(0)
 
 feats = beh.merge(topo, on='account_id')
 print(f'拓扑特征完成 {len(feats):,}')
 
-# ---------- 4. 建模 ----------
-print('\n[3/4] 建模')
-feat_cols = ['total_txn', 'total_amt', 'avg_amt', 'std_amt', 'uniq_opp', 'txn_freq',
-             'night_ratio', 'fast_out_ratio', 'in_degree', 'out_degree', 'pagerank', 'comm_risk_ratio']
+# ---------- 4. 划分训练/测试集并建模 ----------
+print('\n[3/4] 划分训练/测试集并建模')
 lbl = txn[['account_id', 'is_risk']].drop_duplicates().set_index('account_id')
 feats = feats.merge(lbl, left_on='account_id', right_index=True)
 
-X_train, X_test, y_train, y_test = train_test_split(
-    feats[feat_cols], feats['is_risk'],
-    test_size=0.2, stratify=feats['is_risk'], random_state=3407)
+train_feats = feats[feats['account_id'].isin(train_accounts)]
+test_feats = feats[feats['account_id'].isin(test_accounts)]
+
+feat_cols = ['total_txn', 'total_amt', 'avg_amt', 'std_amt', 'uniq_opp', 'txn_freq',
+             'night_ratio', 'fast_out_ratio', 'in_degree', 'out_degree', 'pagerank', 'comm_risk_ratio']
+
+X_train = train_feats[feat_cols]
+y_train = train_feats['is_risk']
+X_test = test_feats[feat_cols]
+y_test = test_feats['is_risk']
+
+print(f'训练集: {len(X_train):,}, 测试集: {len(X_test):,}')
+print(f'测试集风险比例: {y_test.mean():.2%}')
 
 model = xgb.XGBClassifier(
     n_estimators=100, max_depth=6, learning_rate=0.1,
@@ -126,14 +142,14 @@ model.fit(X_train, y_train)
 
 y_pred_p = model.predict_proba(X_test)[:, 1]
 y_pred = model.predict(X_test)
-print(f'AUC  {roc_auc_score(y_test, y_pred_p):.4f}')
-print(f'Recall {recall_score(y_test, y_pred):.4f}')
+
+print(f'AUC  : {roc_auc_score(y_test, y_pred_p):.4f}')
+print(f'Recall: {recall_score(y_test, y_pred):.4f}')
 print(classification_report(y_test, y_pred))
 
 # ---------- 5. 输出 ----------
 print('\n[4/4] 输出评分')
 feats['risk_score'] = model.predict_proba(feats[feat_cols])[:, 1]
-
 def level(s):
     if s > 0.8:
         return '极高风险'
@@ -144,12 +160,13 @@ def level(s):
     elif s > 0.2:
         return '低风险'
     return '正常'
-
 feats['risk_level'] = feats['risk_score'].apply(level)
-out_file = os.path.join(OUTPUT_DIR, 'account_risk_scores.csv')
+
+out_file = os.path.join(OUTPUT_DIR, 'account_risk_scores_no_leak.csv')
 feats.sort_values('risk_score', ascending=False).to_csv(out_file, index=False, encoding='utf-8-sig')
 print(f'评分已保存 → {out_file}')
 
 imp = pd.DataFrame({'feature': feat_cols, 'importance': model.feature_importances_}).sort_values('importance', ascending=False)
-imp.to_csv(os.path.join(OUTPUT_DIR, 'feature_importance.csv'), index=False, encoding='utf-8-sig')
+imp.to_csv(os.path.join(OUTPUT_DIR, 'feature_importance_no_leak.csv'), index=False, encoding='utf-8-sig')
+
 print(f'全部完成！总耗时 {time.time() - start:.2f} s')
