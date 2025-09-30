@@ -131,6 +131,12 @@ print(txn_df['opponent_name'].value_counts().head(15))
 print("\n[5/8] 合并账户风险标签...")
 if '客户唯一id' in account_df.columns:
     account_df.rename(columns={'客户唯一id': 'account_id'}, inplace=True)
+
+# === 关键修复：统一 account_id 为字符串类型 ===
+account_df['account_id'] = account_df['account_id'].astype(str)
+txn_df['account_id'] = txn_df['account_id'].astype(str)
+txn_df['counterparty_id'] = txn_df['counterparty_id'].astype(str)
+
 # 合并发起方标签
 txn_df = txn_df.merge(
     account_df[['account_id', 'label']].rename(columns={'label': 'account_label'}),
@@ -152,6 +158,7 @@ print(f"账户方黑次次密接数：{(txn_df['account_label'] == '黑次次密
 print(f"账户方黑次密接数：{(txn_df['account_label'] == '黑次密接').sum():,}")
 print(f"账户方黑密接数：{(txn_df['account_label'] == '黑密接').sum():,}")
 print(f"账户方黑产数：{(txn_df['account_label'] == '黑').sum():,}")
+print(f"账户方无关数：{(txn_df['account_label'] == '无关').sum():,}")  # 添加这行
 print(f"账户方未知数：{(txn_df['account_label'] == '未知').sum():,}")
 print(f"对手方灰产数：{(txn_df['counterparty_label'] == '灰').sum():,}")
 print(f"对手方黑次次次密接数：{(txn_df['counterparty_label'] == '黑次次次密接').sum():,}")
