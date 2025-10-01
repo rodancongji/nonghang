@@ -82,7 +82,7 @@ print("交易数据 account_label 分布:")
 print(full_txn['account_label'].value_counts().head(10))
 
 # ==================== 2. 构建全量图 H ====================
-print("\n[2/8] 构建全量图 H（用于团伙发掘）...")
+print("\n[2/8] 构建全量图 H")
 full_txn_clean = full_txn[~full_txn['opponent_name'].isin(NOISE)]
 edges_full = full_txn_clean.copy()
 edges_full['weight'] = np.log1p(edges_full['amount'])
@@ -143,6 +143,96 @@ if H_sub.number_of_nodes() > 0:
     community_stats.to_csv(os.path.join(OUTPUT_DIR, 'gang_community_stats.csv'), index=False, encoding='utf-8-sig')
     print(f"团伙发掘完成，共 {len(community_stats)} 个社区")
 
+# === 保存2-hop子图 H_sub 为 JSON（用于可视化）===
+print("正在准备2-hop子图的完整节点和边信息...")
+
+# 1. 构建节点信息
+# 获取子图中所有节点的行为统计
+sub_txn = full_txn[
+    (full_txn['account_id'].isin(H_sub.nodes())) |
+    (full_txn['opponent_name'].isin(H_sub.nodes()))
+    ]
+beh_summary_sub = sub_txn.groupby('account_id').agg(
+    total_txn=('account_id', 'count'),
+    total_amt=('amount', 'sum'),
+    first_txn=('timestamp', 'min'),
+    last_txn=('timestamp', 'max')
+).reset_index()
+
+# 构建 opponent_name 的行为统计（作为外部节点）
+opp_beh = sub_txn.groupby('opponent_name').agg(
+    total_txn=('opponent_name', 'count'),
+    total_amt=('amount', 'sum'),
+    first_txn=('timestamp', 'min'),
+    last_txn=('timestamp', 'max')
+).reset_index()
+opp_beh = opp_beh.rename(columns={'opponent_name': 'account_id'})
+
+# 合并行为统计
+all_beh = pd.concat([beh_summary_sub, opp_beh], ignore_index=True)
+all_beh = all_beh.groupby('account_id').agg({
+    'total_txn': 'sum',
+    'total_amt': 'sum',
+    'first_txn': 'min',
+    'last_txn': 'max'
+}).reset_index()
+
+# 构建节点DataFrame
+nodes_sub = pd.DataFrame({'id': list(H_sub.nodes())})
+nodes_sub['is_account'] = nodes_sub['id'].isin(node_label_map)
+nodes_sub['label'] = np.where(
+    nodes_sub['is_account'],
+    nodes_sub['id'].map(node_label_map),
+    nodes_sub['id'].map(opponent_label_map).fillna('未知')
+)
+nodes_sub = nodes_sub.merge(all_beh, left_on='id', right_on='account_id', how='left')
+nodes_sub['total_txn'] = nodes_sub['total_txn'].fillna(0).astype(int)
+nodes_sub['total_amt'] = nodes_sub['total_amt'].fillna(0.0)
+nodes_sub['first_txn'] = nodes_sub['first_txn'].fillna('').astype(str)
+nodes_sub['last_txn'] = nodes_sub['last_txn'].fillna('').astype(str)
+nodes_sub['community_id'] = nodes_sub['id'].map(community_df.set_index('account_id')['community_id']).fillna(-1).astype(
+    int)
+nodes_sub['node_type'] = np.where(nodes_sub['is_account'], 'account', 'external')
+
+# 2. 构建边信息
+edges_sub = []
+for u, v, data in H_sub.edges(data=True):
+    # 找到原始交易记录（可能有多条，取第一条）
+    edge_mask = (
+            ((full_txn['account_id'] == u) & (full_txn['opponent_name'] == v)) |
+            ((full_txn['account_id'] == v) & (full_txn['opponent_name'] == u))
+    )
+    edge_records = full_txn[edge_mask]
+    if not edge_records.empty:
+        rec = edge_records.iloc[0]
+        direction = '2' if rec['account_id'] == u else '1'
+        timestamp = str(rec['timestamp']) if pd.notna(rec['timestamp']) else ''
+    else:
+        direction = 'unknown'
+        timestamp = ''
+
+    edges_sub.append({
+        'source': u,
+        'target': v,
+        'amount': float(data.get('amount', 0.0)),
+        'weight': float(data.get('weight', 0.0)),
+        'timestamp': timestamp,
+        'direction': direction
+    })
+
+# 3. 保存为JSON
+graph_data = {
+    "nodes": nodes_sub[[
+        'id', 'label', 'node_type', 'community_id',
+        'total_txn', 'total_amt', 'first_txn', 'last_txn'
+    ]].to_dict('records'),
+    "edges": edges_sub
+}
+
+with open(os.path.join(OUTPUT_DIR, 'risk_2hop_subgraph.json'), 'w', encoding='utf-8') as f:
+    json.dump(graph_data, f, ensure_ascii=False, indent=2)
+print("2-hop子图已保存为: risk_2hop_subgraph.json")
+
 # ==================== 4. 构建训练图 G_train ====================
 print("\n[4/8] 构建训练图 G_train（用于 XGBoost 特征）...")
 train_txn_clean = train_txn[~train_txn['opponent_name'].isin(NOISE)]
@@ -159,8 +249,7 @@ edges_train['tgt'] = np.where(edges_train['direction'] == '2', edges_train['oppo
 G_train = nx.from_pandas_edgelist(edges_train, source='src', target='tgt', edge_attr=['weight', 'amount'], create_using=nx.DiGraph())
 print(f"训练图 G_train：{G_train.number_of_nodes():,} 节点, {G_train.number_of_edges():,} 边")
 
-# ==================== 5. 科学识别中介账户 ====================
-# ==================== 5. 科学识别中介账户（高效向量化版 + balance） ====================
+# ==================== 5. 识别中介账户 ====================
 print("\n[5/8] 科学识别中介账户（基于2-hop子图 + 高效向量化快进快出 + balance 无沉淀）...")
 
 candidate_nodes = set(H_sub.nodes()) if 'H_sub' in locals() and H_sub.number_of_nodes() > 0 else set()
