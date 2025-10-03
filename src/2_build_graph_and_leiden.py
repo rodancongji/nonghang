@@ -146,12 +146,15 @@ if H_sub.number_of_nodes() > 0:
 # === 保存2-hop子图 H_sub 为 JSON（用于可视化）===
 print("正在准备2-hop子图的完整节点和边信息...")
 
+# 预先构建 src/tgt 列（与 H 一致）
+full_txn['src'] = np.where(full_txn['direction'] == '2', full_txn['account_id'], full_txn['opponent_name'])
+full_txn['tgt'] = np.where(full_txn['direction'] == '2', full_txn['opponent_name'], full_txn['account_id'])
+
 # 1. 构建节点信息
-# 获取子图中所有节点的行为统计
 sub_txn = full_txn[
     (full_txn['account_id'].isin(H_sub.nodes())) |
     (full_txn['opponent_name'].isin(H_sub.nodes()))
-    ]
+]
 beh_summary_sub = sub_txn.groupby('account_id').agg(
     total_txn=('account_id', 'count'),
     total_amt=('amount', 'sum'),
@@ -159,7 +162,6 @@ beh_summary_sub = sub_txn.groupby('account_id').agg(
     last_txn=('timestamp', 'max')
 ).reset_index()
 
-# 构建 opponent_name 的行为统计（作为外部节点）
 opp_beh = sub_txn.groupby('opponent_name').agg(
     total_txn=('opponent_name', 'count'),
     total_amt=('amount', 'sum'),
@@ -168,7 +170,6 @@ opp_beh = sub_txn.groupby('opponent_name').agg(
 ).reset_index()
 opp_beh = opp_beh.rename(columns={'opponent_name': 'account_id'})
 
-# 合并行为统计
 all_beh = pd.concat([beh_summary_sub, opp_beh], ignore_index=True)
 all_beh = all_beh.groupby('account_id').agg({
     'total_txn': 'sum',
@@ -177,7 +178,6 @@ all_beh = all_beh.groupby('account_id').agg({
     'last_txn': 'max'
 }).reset_index()
 
-# 构建节点DataFrame
 nodes_sub = pd.DataFrame({'id': list(H_sub.nodes())})
 nodes_sub['is_account'] = nodes_sub['id'].isin(node_label_map)
 nodes_sub['label'] = np.where(
@@ -190,35 +190,22 @@ nodes_sub['total_txn'] = nodes_sub['total_txn'].fillna(0).astype(int)
 nodes_sub['total_amt'] = nodes_sub['total_amt'].fillna(0.0)
 nodes_sub['first_txn'] = nodes_sub['first_txn'].fillna('').astype(str)
 nodes_sub['last_txn'] = nodes_sub['last_txn'].fillna('').astype(str)
-nodes_sub['community_id'] = nodes_sub['id'].map(community_df.set_index('account_id')['community_id']).fillna(-1).astype(
-    int)
+nodes_sub['community_id'] = nodes_sub['id'].map(community_df.set_index('account_id')['community_id']).fillna(-1).astype(int)
 nodes_sub['node_type'] = np.where(nodes_sub['is_account'], 'account', 'external')
 
-# 2. 构建边信息
-edges_sub = []
-for u, v, data in H_sub.edges(data=True):
-    # 找到原始交易记录（可能有多条，取第一条）
-    edge_mask = (
-            ((full_txn['account_id'] == u) & (full_txn['opponent_name'] == v)) |
-            ((full_txn['account_id'] == v) & (full_txn['opponent_name'] == u))
-    )
-    edge_records = full_txn[edge_mask]
-    if not edge_records.empty:
-        rec = edge_records.iloc[0]
-        direction = '2' if rec['account_id'] == u else '1'
-        timestamp = str(rec['timestamp']) if pd.notna(rec['timestamp']) else ''
-    else:
-        direction = 'unknown'
-        timestamp = ''
-
-    edges_sub.append({
-        'source': u,
-        'target': v,
-        'amount': float(data.get('amount', 0.0)),
-        'weight': float(data.get('weight', 0.0)),
-        'timestamp': timestamp,
-        'direction': direction
-    })
+# 2. 构建边信息（向量化，避免 for 循环）
+edge_mask = (
+    full_txn['src'].isin(H_sub.nodes()) &
+    full_txn['tgt'].isin(H_sub.nodes())
+)
+sub_edges = full_txn[edge_mask].copy()
+edges_sub = sub_edges[['src', 'tgt', 'amount', 'timestamp', 'direction']].rename(columns={
+    'src': 'source',
+    'tgt': 'target'
+})
+edges_sub['weight'] = np.log1p(edges_sub['amount'])
+edges_sub['timestamp'] = edges_sub['timestamp'].astype(str).fillna('')
+edges_sub = edges_sub.to_dict('records')
 
 # 3. 保存为JSON
 graph_data = {
@@ -266,38 +253,55 @@ else:
         full_txn['direction'].isin(['1', '2'])
     )
     required_cols = ['account_id', 'opponent_name', 'direction', 'amount', 'timestamp', 'balance']
-    txn_as_account = full_txn[valid_mask & full_txn['account_id'].isin(candidate_nodes)][required_cols]
-    txn_as_opponent = full_txn[valid_mask & full_txn['opponent_name'].isin(candidate_nodes)][required_cols]
+    # 直接筛选与 candidate_nodes 相关的所有交易（作为 account 或 opponent）
+    # 分块大小（根据内存调整，50万行约需 500MB 内存）
+    CHUNK_SIZE = 500000
 
-    if not txn_as_opponent.empty:
-        txn_as_opponent_rev = txn_as_opponent.copy()
-        txn_as_opponent_rev['account_id'] = txn_as_opponent['opponent_name']
-        txn_as_opponent_rev['direction'] = txn_as_opponent['direction'].map({'1': '2', '2': '1'})
-        txn_as_opponent_rev['opponent_name'] = txn_as_opponent['account_id']
-        txn_as_opponent_rev['account_label'] = txn_as_opponent_rev['account_id'].map(account_label_map).fillna('未知')
-        candidate_txn = pd.concat([txn_as_account, txn_as_opponent_rev], ignore_index=True)
-    else:
-        candidate_txn = txn_as_account.copy()
-        candidate_txn['account_label'] = candidate_txn['account_id'].map(account_label_map).fillna('未知')
+    # 初始化结果列表
+    all_summary_chunks = []
 
-    if candidate_txn.empty:
+    # 获取候选交易的索引
+    candidate_mask = (
+        valid_mask &
+        (
+            full_txn['account_id'].isin(candidate_nodes) |
+            full_txn['opponent_name'].isin(candidate_nodes)
+        )
+    )
+    candidate_indices = full_txn.index[candidate_mask].tolist()
+
+    if not candidate_indices:
         print("警告：候选交易为空！")
         intermediaries_df = pd.DataFrame(columns=['account_id', 'fast_out_ratio', 'betweenness', 'pagerank', 'intermediary_score'])
     else:
-        print(f"候选交易行数: {len(candidate_txn):,}")
-        candidate_txn['timestamp'] = pd.to_datetime(candidate_txn['timestamp'], errors='coerce')
-        candidate_txn = candidate_txn.dropna(subset=['timestamp'])
+        print(f"候选交易行数: {len(candidate_indices):,}")
 
-        # 分离流入流出，并补全缺失列
-        in_flows = candidate_txn[candidate_txn['direction'] == '1'][['account_id', 'timestamp', 'amount', 'balance']].rename(columns={'timestamp': 'time', 'amount': 'in_amount'})
-        out_flows = candidate_txn[candidate_txn['direction'] == '2'][['account_id', 'timestamp', 'amount']].rename(columns={'timestamp': 'time', 'amount': 'out_amount'})
+        # 分块处理
+        for i in range(0, len(candidate_indices), CHUNK_SIZE):
+            chunk_indices = candidate_indices[i:i + CHUNK_SIZE]
+            chunk = full_txn.loc[chunk_indices, required_cols].copy()
 
-        print(f"候选账户的流入交易: {len(in_flows):,}, 流出交易: {len(out_flows):,}")
+            # 统一 account_id 为 candidate_nodes
+            mask_opponent_in = chunk['opponent_name'].isin(candidate_nodes)
+            if mask_opponent_in.any():
+                temp = chunk.loc[mask_opponent_in, 'account_id'].copy()
+                chunk.loc[mask_opponent_in, 'account_id'] = chunk.loc[mask_opponent_in, 'opponent_name']
+                chunk.loc[mask_opponent_in, 'opponent_name'] = temp
+                chunk.loc[mask_opponent_in, 'direction'] = chunk.loc[mask_opponent_in, 'direction'].map({'1': '2', '2': '1'})
 
-        if in_flows.empty or out_flows.empty:
-            intermediaries_df = pd.DataFrame(columns=['account_id', 'fast_out_ratio', 'betweenness', 'pagerank', 'intermediary_score'])
-        else:
-            # 补全列以便合并
+            # 转换 timestamp 并过滤
+            chunk['timestamp'] = pd.to_datetime(chunk['timestamp'], errors='coerce')
+            chunk = chunk[chunk['timestamp'].notna()]
+            if chunk.empty:
+                continue
+
+            # 分离流入流出
+            in_flows = chunk[chunk['direction'] == '1'][['account_id', 'timestamp', 'amount', 'balance']].rename(columns={'timestamp': 'time', 'amount': 'in_amount'})
+            out_flows = chunk[chunk['direction'] == '2'][['account_id', 'timestamp', 'amount']].rename(columns={'timestamp': 'time', 'amount': 'out_amount'})
+            if in_flows.empty or out_flows.empty:
+                continue
+
+            # 合并并排序
             in_flows['out_amount'] = 0.0
             out_flows['in_amount'] = 0.0
             in_flows['type'] = 'in'
@@ -305,7 +309,7 @@ else:
             all_flows = pd.concat([in_flows, out_flows], ignore_index=True)
             all_flows = all_flows.sort_values(['account_id', 'time']).reset_index(drop=True)
 
-            # 高效向量化快进快出 + balance 无沉淀判断
+            # 应用函数
             def fast_out_ratio_with_balance(group):
                 group = group.sort_values('time').reset_index(drop=True)
                 if len(group) < 2:
@@ -315,7 +319,6 @@ else:
                 if in_rows.empty or in_rows['in_amount'].sum() == 0:
                     return pd.Series({'total_in': 0, 'fast_out_amt': 0, 'low_balance_count': 0})
                 total_in = in_rows['in_amount'].sum()
-                # 快出金额
                 group['next_type'] = group['type'].shift(-1)
                 group['next_time'] = group['time'].shift(-1)
                 group['next_out_amount'] = group['out_amount'].shift(-1).fillna(0)
@@ -326,15 +329,38 @@ else:
                 ]
                 fast_out_amt = 0.0
                 if not valid_in.empty:
-                    # <<< 关键修复：对 valid_in 显式 copy，避免 SettingWithCopyWarning
                     valid_in = valid_in.copy()
                     valid_in['fast_out_amt'] = np.minimum(valid_in['in_amount'], valid_in['next_out_amount'])
                     fast_out_amt = valid_in['fast_out_amt'].sum()
-                # 低余额沉淀计数（balance < 0.2 * in_amount）
                 low_balance_count = ((in_rows['balance'].notna()) & (in_rows['balance'] < 0.2 * in_rows['in_amount'])).sum()
                 return pd.Series({'total_in': total_in, 'fast_out_amt': fast_out_amt, 'low_balance_count': low_balance_count})
 
-            summary = all_flows.groupby('account_id').apply(fast_out_ratio_with_balance).reset_index()
+            chunk_summary = all_flows.groupby('account_id', group_keys=False).apply(fast_out_ratio_with_balance).reset_index()
+            all_summary_chunks.append(chunk_summary)
+
+        if not all_summary_chunks:
+            print("警告：无有效交易块！")
+            intermediaries_df = pd.DataFrame(columns=['account_id', 'fast_out_ratio', 'betweenness', 'pagerank', 'intermediary_score'])
+        else:
+            # 合并所有块的结果
+            summary = pd.concat(all_summary_chunks, ignore_index=True)
+            # 按 account_id 聚合（因为一个账户可能跨块）
+            summary = summary.groupby('account_id').agg({
+                'total_in': 'sum',
+                'fast_out_amt': 'sum',
+                'low_balance_count': 'sum'
+            }).reset_index()
+            summary['fast_out_ratio'] = summary['fast_out_amt'] / summary['total_in']
+            # 重新计算 low_balance_retention（需要流入次数）
+            in_counts = full_txn[
+                valid_mask &
+                (full_txn['account_id'].isin(candidate_nodes)) &
+                (full_txn['direction'] == '1')
+            ].groupby('account_id').size()
+            summary = summary.set_index('account_id')
+            summary['in_count'] = in_counts
+            summary = summary.reset_index()
+            summary['low_balance_retention'] = summary['low_balance_count'] / summary['in_count'].fillna(1)
             summary['fast_out_ratio'] = summary['fast_out_amt'] / summary['total_in']
             summary['low_balance_retention'] = summary['low_balance_count'] / (
                 all_flows[all_flows['type'] == 'in'].groupby('account_id').size().reindex(summary['account_id'], fill_value=1).values
@@ -402,9 +428,9 @@ else:
 
             # ==================== 正式过滤 ====================
             summary = summary[
-                (summary['fast_out_ratio'] >= 0.8) &
+                (summary['fast_out_ratio'] >= 0.6) &
                 (summary['low_balance_retention'] >= 0.5) &
-                (summary['total_in'] >= 100) &
+                (summary['total_in'] >= 50) &
                 (summary['fast_out_ratio'] > 0)
             ]
 
@@ -434,10 +460,10 @@ else:
 
                 candidate_df['is_gray'] = candidate_df['account_id'].map(lambda x: 1 if account_label_map.get(x) == '灰' else 0)
                 candidate_df['intermediary_score'] = (
-                    candidate_df['fast_out_ratio_norm'] * 0.25 +
-                    candidate_df['betweenness_norm'] * 0.25 +
+                    candidate_df['fast_out_ratio_norm'] * 0.3 +
+                    candidate_df['betweenness_norm'] * 0.3 +
                     candidate_df['pagerank_norm'] * 0.2 +
-                    candidate_df['is_gray'] * 0.2 +
+                    candidate_df['is_gray'] * 0.1 +
                     candidate_df['low_balance_retention_norm'] * 0.1
                 )
 
@@ -467,9 +493,9 @@ else:
                             direction='decreasing'
                         )
                         elbow_idx = kn.knee
-                        method_used = "Kneedle 肘部法"
+                        method_used = "Kneedle"
                     except ImportError:
-                        method_used = "回退：二阶导数拐点法"
+                        method_used = "Second derivative"
                         print("  未安装 kneed 库，使用二阶导数拐点法")
                         dy = np.gradient(scores_smooth, x)
                         d2y = np.gradient(dy, x)
@@ -528,8 +554,14 @@ print(f"  识别中介账户 {len(intermediaries_df)} 个")
 print("\n[6/8] 保存训练图结构（用于 XGBoost）...")
 if G_train.number_of_nodes() > 0:
     community_id_map = community_df.set_index('account_id')['community_id'].to_dict() if not community_df.empty else {}
-    node_label_map = train_txn.set_index('account_id')['account_label'].to_dict()
-    opponent_label_map = train_txn.set_index('opponent_name')['counterparty_label'].to_dict()
+    # 复用全局 label 映射，避免对大表 set_index
+    node_label_map = account_label_map  # 已在步骤1定义
+    # 构建 opponent_name -> label 映射（安全方式）
+    opponent_to_id = train_txn[['opponent_name', 'counterparty_id']].drop_duplicates()
+    opponent_label_map = {
+        row['opponent_name']: account_label_map.get(row['counterparty_id'], '未知')
+        for _, row in opponent_to_id.iterrows()
+    }
     risk_set = risk_account_ids_train
 
     all_nodes_list = pd.Series(list(G_train.nodes()), name='id')
@@ -563,57 +595,108 @@ if G_train.number_of_nodes() > 0:
 
 # ==================== 7. 输出高危对手方 Top 100 ====================
 print("\n[7/8] 输出高危对手方 Top 100...")
-risk_flows = train_txn_clean[train_txn_clean['account_label'].isin(RISK_LABELS)]
+# 转为 list 供 query 使用（避免 set 在 query 中不支持）
+risk_list = list(risk_account_ids_train)
+
+# 使用 query 避免大布尔索引 + 深拷贝
+risk_flows = train_txn_clean.query(
+    "account_id in @risk_list or counterparty_id in @risk_list"
+)
+
 top_opponents = risk_flows.groupby('opponent_name').agg(
     transaction_count=('opponent_name', 'count'),
     total_amount=('amount', 'sum'),
     unique_risk_accounts=('account_id', 'nunique')
 ).sort_values('transaction_count', ascending=False).head(100)
+
 top_opponents.to_csv(os.path.join(OUTPUT_DIR, 'high_risk_opponents.csv'), index=True, encoding='utf-8-sig')
 print("高危对手方Top100已保存.")
 
 # ==================== 8. 为交互式可视化系统保存全量图数据 ====================
 print("\n[8/8] 为交互式可视化系统保存全量图数据...")
-edges_full_all = full_txn[['account_id', 'opponent_name', 'direction', 'amount', 'timestamp']].copy()
-edges_full_all['src'] = np.where(edges_full_all['direction'] == '2', edges_full_all['account_id'], edges_full_all['opponent_name'])
-edges_full_all['tgt'] = np.where(edges_full_all['direction'] == '2', edges_full_all['opponent_name'], edges_full_all['account_id'])
 
-node_label_map = account_df.set_index('account_id')['label'].to_dict()
-opponent_to_id = full_txn[['opponent_name', 'counterparty_id']].drop_duplicates()
-id_to_label = account_df.set_index('account_id')['label'].to_dict()
-opponent_label_map = {
-    row['opponent_name']: id_to_label.get(row['counterparty_id'], '未知')
-    for _, row in opponent_to_id.iterrows()
-}
+# === 1. 分块生成边文件（避免 full_txn.copy()）===
+CHUNK_SIZE = 500000
+edge_columns = ['account_id', 'opponent_name', 'direction', 'amount', 'timestamp']
+edge_output_path = os.path.join(OUTPUT_DIR, 'full_graph_edges.csv')
 
-beh_summary = full_txn.groupby('account_id').agg(
-    total_txn=('account_id', 'count'),
-    total_amt=('amount', 'sum'),
-    first_txn=('timestamp', 'min'),
-    last_txn=('timestamp', 'max')
-).reset_index()
+# 初始化边文件（带表头）
+pd.DataFrame(columns=['source', 'target', 'amount', 'timestamp', 'direction']).to_csv(
+    edge_output_path, index=False, encoding='utf-8-sig'
+)
 
-all_nodes_set = set(full_txn['account_id'].unique()) | set(full_txn['opponent_name'].unique())
+print("  正在分块处理边数据...")
+for chunk in pd.read_csv(FULL_TXN_PATH, encoding='utf-8-sig', low_memory=False, chunksize=CHUNK_SIZE):
+    # 过滤噪声交易
+    chunk = chunk[~chunk['opponent_name'].isin(NOISE)]
+    if chunk.empty:
+        continue
+
+    # 构建 src/tgt
+    chunk['source'] = np.where(chunk['direction'] == '2', chunk['account_id'], chunk['opponent_name'])
+    chunk['target'] = np.where(chunk['direction'] == '2', chunk['opponent_name'], chunk['account_id'])
+
+    # 写入边文件（追加模式）
+    edge_chunk = chunk[['source', 'target', 'amount', 'timestamp', 'direction']]
+    edge_chunk.to_csv(edge_output_path, mode='a', header=False, index=False, encoding='utf-8-sig')
+
+print("  边数据已保存至: full_graph_edges.csv")
+
+# === 2. 构建节点数据 ===
+# 从边文件中提取所有唯一节点
+print("  正在提取节点列表...")
+all_nodes_set = set()
+for chunk in pd.read_csv(edge_output_path, encoding='utf-8-sig', usecols=['source', 'target'], chunksize=CHUNK_SIZE):
+    all_nodes_set.update(chunk['source'].dropna().astype(str))
+    all_nodes_set.update(chunk['target'].dropna().astype(str))
+
+# 构建节点 DataFrame
 nodes_df = pd.DataFrame({'id': list(all_nodes_set)})
-nodes_df['is_account'] = nodes_df['id'].isin(node_label_map)
+nodes_df['is_account'] = nodes_df['id'].isin(account_label_map)
 nodes_df['label'] = np.where(
     nodes_df['is_account'],
-    nodes_df['id'].map(node_label_map),
-    nodes_df['id'].map(opponent_label_map).fillna('未知')
+    nodes_df['id'].map(account_label_map),
+    '未知'  # 对手方无 counterparty_id 映射，统一为'未知'
 )
-beh_summary_df = beh_summary.rename(columns={'account_id': 'id'})
-nodes_df = nodes_df.merge(beh_summary_df, on='id', how='left')
+nodes_df['node_type'] = np.where(nodes_df['is_account'], 'account', 'external')
+
+# 分块计算行为统计
+print("  正在分块计算节点行为统计...")
+beh_summary = pd.DataFrame()
+for chunk in pd.read_csv(FULL_TXN_PATH, encoding='utf-8-sig', low_memory=False, chunksize=CHUNK_SIZE):
+    chunk = chunk[~chunk['opponent_name'].isin(NOISE)]
+    if chunk.empty:
+        continue
+    summary_chunk = chunk.groupby('account_id').agg(
+        total_txn=('account_id', 'count'),
+        total_amt=('amount', 'sum'),
+        first_txn=('timestamp', 'min'),
+        last_txn=('timestamp', 'max')
+    ).reset_index()
+    beh_summary = pd.concat([beh_summary, summary_chunk], ignore_index=True)
+
+# 聚合跨块统计
+if not beh_summary.empty:
+    beh_summary = beh_summary.groupby('account_id').agg({
+        'total_txn': 'sum',
+        'total_amt': 'sum',
+        'first_txn': 'min',
+        'last_txn': 'max'
+    }).reset_index()
+    nodes_df = nodes_df.merge(beh_summary.rename(columns={'account_id': 'id'}), on='id', how='left')
+
+# 填充缺失值
 nodes_df['total_txn'] = nodes_df['total_txn'].fillna(0).astype(int)
 nodes_df['total_amt'] = nodes_df['total_amt'].fillna(0.0)
 nodes_df['first_txn'] = nodes_df['first_txn'].fillna('').astype(str)
 nodes_df['last_txn'] = nodes_df['last_txn'].fillna('').astype(str)
-nodes_df['node_type'] = np.where(nodes_df['is_account'], 'account', 'external')
 
-nodes_output = nodes_df[['id', 'node_type', 'label', 'total_txn', 'total_amt', 'first_txn', 'last_txn']]
-nodes_output.to_csv(os.path.join(OUTPUT_DIR, 'full_graph_nodes.csv'), index=False, encoding='utf-8-sig')
-
-edges_output = edges_full_all[['src', 'tgt', 'amount', 'timestamp', 'direction']].rename(columns={'src': 'source', 'tgt': 'target'})
-edges_output.to_csv(os.path.join(OUTPUT_DIR, 'full_graph_edges.csv'), index=False, encoding='utf-8-sig')
+# 保存节点文件
+node_output_path = os.path.join(OUTPUT_DIR, 'full_graph_nodes.csv')
+nodes_df[['id', 'node_type', 'label', 'total_txn', 'total_amt', 'first_txn', 'last_txn']].to_csv(
+    node_output_path, index=False, encoding='utf-8-sig'
+)
+print("  节点数据已保存至: full_graph_nodes.csv")
 
 if 'community_stats' in locals() and not community_stats.empty:
     gang_summary = []
