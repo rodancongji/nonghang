@@ -186,8 +186,8 @@ print(f"\n>>> 自环交易（account_id == counterparty_id）数：{len(self_loo
 if len(self_loops) > 0:
     print("自环交易示例：")
     print(self_loops[['account_id', 'counterparty_id', 'opponent_name', 'amount', 'direction']].head())
-# 3. 分析每个 account_id 最常交易的 counterparty_name（Top 3）—— 内存安全版
-print(f"\n>>> 每个账户最频繁交易的对手方（Top 3）示例（展示前5个账户）：")
+# 3. 分析每个 account_id 最常交易的 counterparty_name（Top 5）—— 内存安全版
+print(f"\n>>> 每个账户最频繁交易的对手方（Top 5）示例（展示前5个账户）：")
 # 手动遍历分组，避免 Pandas apply + dict 崩溃
 top_counterparties_list = []
 grouped = txn_df.groupby('account_id')['opponent_name']
@@ -195,10 +195,10 @@ grouped = txn_df.groupby('account_id')['opponent_name']
 sample_accounts = txn_df['account_id'].unique()[:1000]
 for account in sample_accounts:
     name_series = grouped.get_group(account)
-    top3_dict = name_series.value_counts().head(3).to_dict()
+    top5_dict = name_series.value_counts().head(3).to_dict()
     top_counterparties_list.append({
         'account_id': account,
-        'top_counterparties': top3_dict
+        'top_counterparties': top5_dict
     })
 # 转为 DataFrame
 top_counterparties_per_account = pd.DataFrame(top_counterparties_list)
