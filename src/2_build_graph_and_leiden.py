@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-步骤2：全量图团伙发掘 + 训练图特征构建（科学可行版 - 修复中介识别 + 引入 balance 判断快进快出）
+步骤2：全量图团伙发掘 + 训练图特征构建（防标签泄露修正版）
 功能：
-  - 构建全量图 H（团伙发掘）
-  - 构建训练图 G_train（XGBoost 特征）
-  - **正确识别中介账户：包含'灰'账户 + 高频未知对手方（opponent_name），基于快进快出 + 局部 Betweenness + PageRank + balance 无沉淀**
+  - 构建全量图 H（团伙发掘、中介识别、可视化）
+  - **新增：构建训练图 G_train_sub 并独立进行团伙发掘，输出 gang_communities_train.csv**
+  - 构建训练图 G_train（XGBoost 特征），其 community_id 来自训练图团伙
+  - **正确识别中介账户：... (保留原逻辑)**
   - 保留高危对手方 Top100
   - **为交互式可视化系统保存全量图数据**
 """
@@ -12,7 +13,7 @@ import os, time, json, numpy as np, pandas as pd, networkx as nx, igraph as ig, 
 import matplotlib
 matplotlib.use('Agg')  # 避免 GUI 后端问题
 
-print("=== 步骤2：全量图团伙发掘 + 训练图特征构建 ===")
+print("=== 步骤2：全量图团伙发掘 + 训练图特征构建（防标签泄露修正版） ===")
 start = time.time()
 
 FULL_TXN_PATH = 'D:/Pycharm/Intermediaries_digging/data/cleaned_transactions.csv'
@@ -24,7 +25,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 NOISE = ['微信转账', '扫二维码付款', '微信红包', '还款', '手机充值', '零钱通', '生活缴费', '我的钱包', '待报解预算收入']
 
 # ==================== 1. 加载数据 ====================
-print("\n[1/8] 加载全量和训练交易数据...")
+print("\n[1/9] 加载全量和训练交易数据...")
 full_txn = pd.read_csv(FULL_TXN_PATH, encoding='utf-8-sig', low_memory=False)
 train_txn = pd.read_csv(TRAIN_TXN_PATH, encoding='utf-8-sig', low_memory=False)
 test_accounts = set(pd.read_csv(TEST_IDS_PATH, encoding='utf-8-sig')['account_id'])
@@ -87,7 +88,7 @@ full_txn['src'] = np.where(full_txn['direction'] == '2', full_txn['account_id'],
 full_txn['tgt'] = np.where(full_txn['direction'] == '2', full_txn['opponent_name'], full_txn['account_id'])
 
 # ==================== 2. 构建全量图 H ====================
-print("\n[2/8] 构建全量图 H")
+print("\n[2/9] 构建全量图 H")
 full_txn_clean = full_txn[~full_txn['opponent_name'].isin(NOISE)]
 edges_full = full_txn_clean.copy()
 edges_full['weight'] = np.log1p(edges_full['amount'])
@@ -97,8 +98,8 @@ edges_full['tgt'] = np.where(edges_full['direction'] == '2', edges_full['opponen
 H = nx.from_pandas_edgelist(edges_full, source='src', target='tgt', edge_attr=['weight', 'amount'], create_using=nx.DiGraph())
 print(f"全量图 H：{H.number_of_nodes():,} 节点, {H.number_of_edges():,} 边")
 
-# ==================== 3. 2-hop 子图 + 团伙发掘 ====================
-print("\n[3/8] 全量图 2-hop 子图 + 团伙发掘...")
+# ==================== 3. 全量图 2-hop 子图 + 团伙发掘 ====================
+print("\n[3/9] 全量图 2-hop 子图 + 团伙发掘...")
 risk_nodes = list(risk_account_ids_full & set(H.nodes()))
 all_nodes = set()
 if risk_nodes:
@@ -123,7 +124,7 @@ if H_sub.number_of_nodes() > 0:
     except Exception as e:
         print(f"警告：H_sub 中心性计算失败: {e}")
 
-community_df = pd.DataFrame()
+community_df_full = pd.DataFrame()
 if H_sub.number_of_nodes() > 0:
     g_ig = ig.Graph.from_networkx(H_sub)
     if 'weight' not in g_ig.edge_attributes():
@@ -140,26 +141,26 @@ if H_sub.number_of_nodes() > 0:
     if best_part:
         node_list = list(H_sub.nodes())
         comm_map = dict(zip(node_list, best_part.membership))
-        community_df = pd.DataFrame([{'account_id': node, 'community_id': cid} for node, cid in comm_map.items()])
+        community_df_full = pd.DataFrame([{'account_id': node, 'community_id': cid} for node, cid in comm_map.items()])
 
     node_label_map = full_txn.set_index('account_id')['account_label'].to_dict()
     opponent_label_map = full_txn.set_index('opponent_name')['counterparty_label'].to_dict()
-    community_df['account_label'] = community_df['account_id'].map(
+    community_df_full['account_label'] = community_df_full['account_id'].map(
         lambda x: node_label_map.get(x, opponent_label_map.get(x, '未知'))
     )
 
-    community_stats = community_df.groupby('community_id').agg(
+    community_stats_full = community_df_full.groupby('community_id').agg(
         total_nodes=('account_id', 'count'),
         risk_nodes=('account_label', lambda x: x.isin(RISK_LABELS).sum()),
         risk_ratio=('account_label', lambda x: x.isin(RISK_LABELS).mean())
     ).sort_values('risk_ratio', ascending=False)
 
-    community_df.to_csv(os.path.join(OUTPUT_DIR, 'gang_communities.csv'), index=False, encoding='utf-8-sig')
-    community_stats.to_csv(os.path.join(OUTPUT_DIR, 'gang_community_stats.csv'), index=False, encoding='utf-8-sig')
-    print(f"团伙发掘完成，共 {len(community_stats)} 个社区")
+    community_df_full.to_csv(os.path.join(OUTPUT_DIR, 'gang_communities_full.csv'), index=False, encoding='utf-8-sig')
+    community_stats_full.to_csv(os.path.join(OUTPUT_DIR, 'gang_community_stats_full.csv'), index=False, encoding='utf-8-sig')
+    print(f"全量团伙发掘完成，共 {len(community_stats_full)} 个社区")
 
 # ==================== 4. 构建训练图 G_train ====================
-print("\n[4/8] 构建训练图 G_train（用于 XGBoost 特征）...")
+print("\n[4/9] 构建训练图 G_train（用于 XGBoost 特征）...")
 train_txn_clean = train_txn[~train_txn['opponent_name'].isin(NOISE)]
 train_txn_clean = train_txn_clean[
     (train_txn_clean['account_label'].isin(RISK_LABELS)) |
@@ -174,8 +175,62 @@ edges_train['tgt'] = np.where(edges_train['direction'] == '2', edges_train['oppo
 G_train = nx.from_pandas_edgelist(edges_train, source='src', target='tgt', edge_attr=['weight', 'amount'], create_using=nx.DiGraph())
 print(f"训练图 G_train：{G_train.number_of_nodes():,} 节点, {G_train.number_of_edges():,} 边")
 
-# ==================== 5. 识别中介账户 ====================
-print("\n[5/8] 科学识别中介账户（基于2-hop子图 + 高效向量化快进快出 + balance 无沉淀）...")
+# ==================== 5. 【新增】训练图团伙发掘 ====================
+print("\n[5/9] 【新增】训练图团伙发掘（防泄露！）...")
+risk_nodes_train = list(risk_account_ids_train & set(G_train.nodes()))
+all_nodes_train = set()
+if risk_nodes_train:
+    for node in risk_nodes_train:
+        all_nodes_train.add(node)
+        neighbors = set(G_train.successors(node)) | set(G_train.predecessors(node))
+        all_nodes_train.update(neighbors)
+        for nb in neighbors:
+            if nb in G_train:
+                nb_neighbors = set(G_train.successors(nb)) | set(G_train.predecessors(nb))
+                all_nodes_train.update(nb_neighbors)
+G_sub_train = G_train.subgraph(all_nodes_train).copy()
+print(f"训练2-hop子图：{G_sub_train.number_of_nodes():,} 节点, {G_sub_train.number_of_edges():,} 边")
+
+community_df_train = pd.DataFrame()
+if G_sub_train.number_of_nodes() > 0:
+    g_ig_train = ig.Graph.from_networkx(G_sub_train)
+    if 'weight' not in g_ig_train.edge_attributes():
+        g_ig_train.es['weight'] = [1.0] * g_ig_train.ecount()
+    best_mod_train = -1
+    best_part_train = None
+    for res in [0.1, 0.5, 1.0, 1.5, 2.0]:
+        try:
+            part_train = la.find_partition(g_ig_train, la.RBConfigurationVertexPartition, resolution_parameter=res, weights=g_ig_train.es['weight'])
+            if part_train.modularity > best_mod_train:
+                best_mod_train, best_part_train = part_train.modularity, part_train
+        except:
+            continue
+    if best_part_train:
+        node_list_train = list(G_sub_train.nodes())
+        comm_map_train = dict(zip(node_list_train, best_part_train.membership))
+        community_df_train = pd.DataFrame([{'account_id': node, 'community_id': cid} for node, cid in comm_map_train.items()])
+
+        # **关键：仅使用训练期标签计算社区风险**
+        train_label_map = train_txn.set_index('account_id')['account_label'].to_dict()
+        train_opponent_label_map = train_txn.set_index('opponent_name')['counterparty_label'].to_dict()
+        community_df_train['account_label'] = community_df_train['account_id'].map(
+            lambda x: train_label_map.get(x, train_opponent_label_map.get(x, '未知'))
+        )
+
+        community_stats_train = community_df_train.groupby('community_id').agg(
+            total_nodes=('account_id', 'count'),
+            risk_nodes=('account_label', lambda x: x.isin(RISK_LABELS).sum()),
+            risk_ratio=('account_label', lambda x: x.isin(RISK_LABELS).mean())
+        ).sort_values('risk_ratio', ascending=False)
+
+        community_df_train.to_csv(os.path.join(OUTPUT_DIR, 'gang_communities_train.csv'), index=False, encoding='utf-8-sig')
+        community_stats_train.to_csv(os.path.join(OUTPUT_DIR, 'gang_community_stats_train.csv'), index=False, encoding='utf-8-sig')
+        print(f"训练团伙发掘完成，共 {len(community_stats_train)} 个社区")
+else:
+    print("训练2-hop子图为空，跳过训练团伙发掘。")
+
+# ==================== 6. 识别中介账户 ====================
+print("\n[6/9] 科学识别中介账户（基于2-hop子图 + 高效向量化快进快出 + balance 无沉淀）...")
 
 candidate_nodes = set(H_sub.nodes()) if 'H_sub' in locals() and H_sub.number_of_nodes() > 0 else set()
 if not candidate_nodes:
@@ -511,7 +566,7 @@ if 'H_sub' in locals() and H_sub.number_of_nodes() > 0:
     nodes_sub['total_amt'] = nodes_sub['total_amt'].fillna(0.0)
     nodes_sub['first_txn'] = nodes_sub['first_txn'].fillna('').astype(str)
     nodes_sub['last_txn'] = nodes_sub['last_txn'].fillna('').astype(str)
-    nodes_sub['community_id'] = nodes_sub['id'].map(community_df.set_index('account_id')['community_id']).fillna(-1).astype(int)
+    nodes_sub['community_id'] = nodes_sub['id'].map(community_df_full.set_index('account_id')['community_id']).fillna(-1).astype(int)
     nodes_sub['node_type'] = np.where(nodes_sub['is_account'], 'account', 'external')
 
     nodes_sub = nodes_sub.sort_values(['community_id', 'id']).reset_index(drop=True)
@@ -572,10 +627,11 @@ if 'H_sub' in locals() and H_sub.number_of_nodes() > 0:
 else:
     print("  跳过2-hop子图保存（H_sub为空）")
 
-# ==================== 6. 保存训练图结构 ====================
-print("\n[6/8] 保存训练图结构（用于 XGBoost）...")
+# ==================== 8. 保存训练图结构（关键修改点） ====================
+print("\n[8/9] 保存训练图结构（使用训练图社区ID，防泄露！）...")
 if G_train.number_of_nodes() > 0:
-    community_id_map = community_df.set_index('account_id')['community_id'].to_dict() if not community_df.empty else {}
+    # **关键修改：使用训练图社区 community_df_train**
+    community_id_map_train = community_df_train.set_index('account_id')['community_id'].to_dict() if not community_df_train.empty else {}
     node_label_map = account_label_map
     opponent_to_id = train_txn[['opponent_name', 'counterparty_id']].drop_duplicates()
     opponent_label_map = {
@@ -598,7 +654,8 @@ if G_train.number_of_nodes() > 0:
     nodes_df = pd.DataFrame({'id': list(G_train.nodes())})
     nodes_df['account_label'] = nodes_df['id'].map(lambda x: node_label_map.get(x, opponent_label_map.get(x, '未知')))
     nodes_df['node_type'] = np.where(nodes_df['id'].isin(risk_account_ids_train), 'account', 'external')
-    nodes_df['community_id'] = nodes_df['id'].map(community_id_map).fillna(-1).astype(int)
+    # **关键修改：这里使用 community_id_map_train**
+    nodes_df['community_id'] = nodes_df['id'].map(community_id_map_train).fillna(-1).astype(int)
     nodes_df['intermediary_score'] = nodes_df['id'].map(intermediaries_df.set_index('account_id')['intermediary_score']).fillna(0.0)
     nodes_df = nodes_df.merge(weighted_in_degree, left_on='id', right_index=True, how='left')
     nodes_df = nodes_df.merge(pagerank_g, left_on='id', right_index=True, how='left')
@@ -611,10 +668,10 @@ if G_train.number_of_nodes() > 0:
 
     with open(os.path.join(OUTPUT_DIR, 'risk_propagation_graph_train.json'), 'w', encoding='utf-8') as f:
         json.dump({"nodes": nodes_data, "edges": edges_data}, f, ensure_ascii=False, indent=2)
-    print("训练图结构已保存.")
+    print("训练图结构已保存（使用训练图社区ID）.")
 
-# ==================== 7. 输出高危对手方 Top 100 ====================
-print("\n[7/8] 输出高危对手方 Top 100...")
+# ==================== 8. 输出高危对手方 Top 100 ====================
+print("\n[8/9] 输出高危对手方 Top 100...")
 risk_list = list(risk_account_ids_train)
 risk_flows = train_txn_clean.query("account_id in @risk_list or counterparty_id in @risk_list")
 
@@ -627,8 +684,8 @@ top_opponents = risk_flows.groupby('opponent_name').agg(
 top_opponents.to_csv(os.path.join(OUTPUT_DIR, 'high_risk_opponents.csv'), index=True, encoding='utf-8-sig')
 print("高危对手方Top100已保存.")
 
-# ==================== 8. 为交互式可视化系统保存全量图数据 ====================
-print("\n[8/8] 为交互式可视化系统保存全量图数据...")
+# ==================== 9. 为交互式可视化系统保存全量图数据 ====================
+print("\n[9/9] 为交互式可视化系统保存全量图数据...")
 
 CHUNK_SIZE = 500000
 edge_output_path = os.path.join(OUTPUT_DIR, 'full_graph_edges.csv')
@@ -697,10 +754,10 @@ nodes_df[['id', 'node_type', 'label', 'total_txn', 'total_amt', 'first_txn', 'la
 )
 print("  节点数据已保存至: full_graph_nodes.csv")
 
-if 'community_stats' in locals() and not community_stats.empty:
+if 'community_stats_full' in locals() and not community_stats_full.empty:
     gang_summary = []
-    for cid, row in community_stats.iterrows():
-        members = community_df[community_df['community_id'] == cid]['account_id'].tolist()
+    for cid, row in community_stats_full.iterrows():
+        members = community_df_full[community_df_full['community_id'] == cid]['account_id'].tolist()
         rep_nodes = members[:3]
         gang_summary.append({
             'community_id': int(cid),
